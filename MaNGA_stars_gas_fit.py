@@ -10,7 +10,7 @@ from scipy import ndimage
 import manga_tools as m
 
 
-def setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z):
+def setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z, **kwargs):
     '''
     using a single FITS file with a T/Z/L grid of spectra,
     make a spectral library at the correct velocity scale
@@ -42,7 +42,7 @@ def setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z):
     # Sigma difference in pixels
     sigma = (FWHM_dif/2.355/FWHM_tem)
     # print sigma
-    a_f = convolve_variable_width(SSPs_hdu[0].data, sigma)
+    a_f = convolve_variable_width(SSPs_hdu[0].data, sigma, **kwargs)
 
     fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
     print '\tMaking HDU:', fname2
@@ -75,6 +75,7 @@ def convolve_variable_width(a, sig, prec=1.):
         length of `sig` (each element of a must have a convolution width)'
 
     sig0 = sig.max()  # the "base" width that results in minimal blurring
+    # if prec = 1, just use sig0 as base.
     n = np.rint(prec * sig0/sig).astype(int)
     # print n
     print '\tWarped array length: {}'.format(n.sum())
@@ -95,6 +96,7 @@ def convolve_variable_width(a, sig, prec=1.):
 
     # now convolve the whole thing with a Gaussian of width sig0
     print '\tCONVOLVE...'
+    # account for the increased precision required
     a_w_f = ndimage.gaussian_filter1d(a_w, prec*sig0, axis=-1)
     # print a_w_f.shape # should be the same as the original shape
 
@@ -127,8 +129,9 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
 
     print 'Constructing wavelength grid...'
     # read in some average value for wavelength solution and spectral res
-    lam_ifu = m.wave(MaNGA_hdu).data
-    R_avg, l_avg = m.res_over_plate('MPL-3', '7443', plot=plot)
+    L_ifu = m.wave(MaNGA_hdu).data
+    R_avg, l_avg, = m.res_over_plate('MPL-3', '7443', plot=plot)
+    FWHM_avg = l_avg / R_avg  # FWHM of a galaxy in AA at some wavelength
 
     # now read in basic info about templates and
     # up-sample "real" spectral resolution to the model wavelength grid
@@ -144,14 +147,22 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     dL_tem[:-1] = L_tem[1:] - L_tem[:-1]
     dL_tem[-1] = dL_tem[-2]  # this is not exact, but it's efficient
 
-    R_avg_s = np.interp(x=L_tem, xp=l_avg, fp=R_avg)
+    # since the impulse-response of the templates is infinitely thin
+    # approximate the FWHM as half the pixel width
+    FWHM_tem = dL_tem/2.
+
+    FWHM_avg_s = np.interp(x=L_tem, xp=l_avg, fp=FWHM_avg)
 
     if plot == True:
         plt.close('all')
         fig = plt.figure(figsize=(8, 6))
         ax = fig.add_subplot(111)
-        for z in np.linspace(0.0, 0.020, 21):
-            ax.plot(L_tem, (L_tem/dL_tem/(1+z))/(R_avg_s),
+        for z in [0.00, 0.01, 0.02]:
+            # get sigma for a bunch of different redshifts
+            FWHM_diff_ = np.sqrt(
+                (FWHM_avg_s / (1. + z))**2. - FWHM_tem**2.)
+            sigma_ = FWHM_diff_/2.355/dL_tem
+            ax.plot(L_tem, sigma_,
                     label='z = {:.3f}'.format(z))
         ax.legend(loc='best')
         ax.set_xlabel(r'$\lambda[\AA]$')
@@ -159,17 +170,10 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
         plt.tight_layout()
         plt.show()
 
-    return None
+    logL_ifu = np.log(L_ifu)
 
-    logL_spec = np.log(lam_spec)
-
-    # NOW convert to base e
-    velscale = np.asarray(
-        (np.log(lam_spec[1]/lam_spec[0]) * c.c).to(u.km/u.s))
-
-    FWHM_gal_pix = 3.
-
-    FWHM_gal = FWHM_gal_pix * velscale / (u.km / u.s)
+    velscale_ifu = np.asarray(
+        (np.log(L_ifu[1]/L_ifu[0]) * c.c).to(u.km/u.s))
 
     print 'Constructing spectral library files...'
 
@@ -177,6 +181,19 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     # file format is st-<REDSHIFT>.fits
     # <REDSHIFT> is of form 0.XXXX
 
-    for z in np.arange(0., .18, .01):
-        print 'z: {0:.4f}'.format(z)
-        setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z)
+    for i, z in enumerate([0.01]):
+        print 'Template file {1} @ z = {0:.4f}'.format(z, i)
+
+        FWHM_diff = np.sqrt(
+            (FWHM_avg_s / (1. + z))**2. - FWHM_tem**2.)
+        sigma = FWHM_diff/2.355/dL_tem
+
+        a_f = convolve_variable_width(SSPs_hdu[0].data, sigma, prec=10.)
+
+        fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
+        print '\tMaking HDU:', fname2
+
+        blurred_hdu = fits.PrimaryHDU(a_f)
+        blurred_hdu.header = h
+        blurred_hdu.header['z'] = z
+        blurred_hdu.writeto(fname2, clobber=True)
