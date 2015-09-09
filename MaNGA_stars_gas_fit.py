@@ -54,7 +54,7 @@ def setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z):
     return blurred_hdu
 
 
-def convolve_variable_width(a, sig):
+def convolve_variable_width(a, sig, prec=1.):
     '''
     approximate convolution with a kernel that varies along the spectral
         direction, by stretching the data by the inverse of the kernel's
@@ -68,13 +68,14 @@ def convolve_variable_width(a, sig):
      - a: N-D array; convolution will occur along the final axis
      - sig: 1-D array (must have same length as the final axis of a);
         describes the varying width of the kernel
+     - prec: precision argument. When higher, oversampling is more thorough
     '''
 
     assert (len(sig) == a.shape[-1]), '\tLast dimension of `a` must equal \
         length of `sig` (each element of a must have a convolution width)'
 
     sig0 = sig.max()  # the "base" width that results in minimal blurring
-    n = np.rint(sig0/sig).astype(int)
+    n = np.rint(prec * sig0/sig).astype(int)
     # print n
     print '\tWarped array length: {}'.format(n.sum())
     # define "warped" array a_w with n[i] instances of a[:,:,i]
@@ -94,7 +95,7 @@ def convolve_variable_width(a, sig):
 
     # now convolve the whole thing with a Gaussian of width sig0
     print '\tCONVOLVE...'
-    a_w_f = ndimage.gaussian_filter1d(a_w, sig0, axis=-1)
+    a_w_f = ndimage.gaussian_filter1d(a_w, prec*sig0, axis=-1)
     # print a_w_f.shape # should be the same as the original shape
 
     # and downselect the pixels (take approximate middle of each slice)
@@ -103,11 +104,12 @@ def convolve_variable_width(a, sig):
     # un-warp the newly-convolved array by selecting only the slices
     # in dimension -1 that are in nm
     a_f = a_w_f[:, :, nm]
+    assert a_f.shape == a.shape, 'Unequal before & after shapes!'
 
     return a_f
 
 
-def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem):
+def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     '''
     set up all the required stellar libraries for a MaNGA datacube
 
@@ -122,15 +124,44 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem):
 
     # open global MaNGA header
     glob_h = MaNGA_hdu[0].header
-    specres, specres_h = \
-        MaNGA_hdu['SPECRES'].data, MaNGA_hdu['SPECRES'].header
 
     print 'Constructing wavelength grid...'
-    lam_spec = np.logspace(glob_h['CRVAL3'], glob_h['CRVAL3'] +
-                           glob_h['NAXIS3'] * glob_h['CD3_3'],
-                           glob_h['NAXIS3'], base=10.)  # base 10
+    # read in some average value for wavelength solution and spectral res
+    lam_ifu = m.wave(MaNGA_hdu).data
+    R_avg, l_avg = m.res_over_plate('MPL-3', '7443', plot=plot)
 
-    loglam_spec = np.log(lam_spec)
+    # now read in basic info about templates and
+    # up-sample "real" spectral resolution to the model wavelength grid
+    tems = fits.open(fname_tem)[0]
+    htems = tems.header
+    logL_tem = np.linspace(
+        htems['CRVAL3'],
+        htems['CRVAL3'] + tems.data.shape[2]*htems['CDELT3'],
+        tems.data.shape[2])  # base e
+    L_tem = np.exp(logL_tem)
+
+    dL_tem = np.empty_like(L_tem)
+    dL_tem[:-1] = L_tem[1:] - L_tem[:-1]
+    dL_tem[-1] = dL_tem[-2]  # this is not exact, but it's efficient
+
+    R_avg_s = np.interp(x=L_tem, xp=l_avg, fp=R_avg)
+
+    if plot == True:
+        plt.close('all')
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111)
+        for z in np.linspace(0.0, 0.020, 21):
+            ax.plot(L_tem, (L_tem/dL_tem/(1+z))/(R_avg_s),
+                    label='z = {:.3f}'.format(z))
+        ax.legend(loc='best')
+        ax.set_xlabel(r'$\lambda[\AA]$')
+        ax.set_ylabel(r'$\frac{R_{tem}}{R_{spec}}$')
+        plt.tight_layout()
+        plt.show()
+
+    return None
+
+    logL_spec = np.log(lam_spec)
 
     # NOW convert to base e
     velscale = np.asarray(
