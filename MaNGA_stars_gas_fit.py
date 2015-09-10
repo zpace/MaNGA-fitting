@@ -10,50 +10,6 @@ from scipy import ndimage
 import manga_tools as m
 
 
-def setup_stellar_library_file(fname_tem, velscale, FWHM_gal, z, **kwargs):
-    '''
-    using a single FITS file with a T/Z/L grid of spectra,
-    make a spectral library at the correct velocity scale
-    '''
-
-    SSPs_hdu = fits.open(fname_tem)
-    h = SSPs_hdu[0].header
-
-    # for some reason, the header keywords are getting messed up
-    # when they're pushed to the file
-    # so we need to manually get the shapes in each axis
-    # (axes are more or less hard-coded in)
-
-    logL = np.linspace(h['CRVAL3'],
-                       h['CRVAL3'] + SSPs_hdu[0].data.shape[2]*h['CDELT3'],
-                       SSPs_hdu[0].data.shape[2])  # base e
-
-    L = np.exp(logL)  # also base e
-
-    lam_range_tem = np.array([L[0], L[-1]])
-
-    FWHM_tem = (L[1:] - L[:-1])
-    FWHM_tem = np.append(FWHM_tem,
-                         [(FWHM_tem[-1] - FWHM_tem[-2]) + FWHM_tem[-1]])
-
-    FWHM_gal /= (1 + z)
-
-    FWHM_dif = np.sqrt(FWHM_gal.value**2)  # - FWHM_tem**2)
-    # Sigma difference in pixels
-    sigma = (FWHM_dif/2.355/FWHM_tem)
-    # print sigma
-    a_f = convolve_variable_width(SSPs_hdu[0].data, sigma, **kwargs)
-
-    fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
-    print '\tMaking HDU:', fname2
-
-    blurred_hdu = fits.PrimaryHDU(a_f)
-    blurred_hdu.header = h
-    blurred_hdu.header['z'] = z
-    blurred_hdu.writeto(fname2, clobber=True)
-    return blurred_hdu
-
-
 def convolve_variable_width(a, sig, prec=1.):
     '''
     approximate convolution with a kernel that varies along the spectral
@@ -97,7 +53,16 @@ def convolve_variable_width(a, sig, prec=1.):
     # now convolve the whole thing with a Gaussian of width sig0
     print '\tCONVOLVE...'
     # account for the increased precision required
-    a_w_f = ndimage.gaussian_filter1d(a_w, prec*sig0, axis=-1)
+    a_w_f = np.empty_like(a_w)
+    # have to iterate over the rows and columns, to avoid MemoryError
+    c = 0  # counter (don't judge me, it was early in the morning)
+    for i in range(a_w_f.shape[0]):
+        for j in range(a_w_f.shape[1]):
+            c += 1
+            print '\t\tComputing convolution {} of {}...'.format(
+                c, a_w_f.shape[0] * a_w_f.shape[1])
+            a_w_f[i, j, :] = ndimage.gaussian_filter1d(
+                a_w[i, j, :], prec*sig0)
     # print a_w_f.shape # should be the same as the original shape
 
     # and downselect the pixels (take approximate middle of each slice)
@@ -106,7 +71,6 @@ def convolve_variable_width(a, sig, prec=1.):
     # un-warp the newly-convolved array by selecting only the slices
     # in dimension -1 that are in nm
     a_f = a_w_f[:, :, nm]
-    assert a_f.shape == a.shape, 'Unequal before & after shapes!'
 
     return a_f
 
@@ -188,12 +152,12 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
             (FWHM_avg_s / (1. + z))**2. - FWHM_tem**2.)
         sigma = FWHM_diff/2.355/dL_tem
 
-        a_f = convolve_variable_width(SSPs_hdu[0].data, sigma, prec=10.)
+        a_f = convolve_variable_width(tems.data, sigma, prec=2.)
 
         fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
         print '\tMaking HDU:', fname2
 
         blurred_hdu = fits.PrimaryHDU(a_f)
-        blurred_hdu.header = h
+        blurred_hdu.header = tems.header
         blurred_hdu.header['z'] = z
         blurred_hdu.writeto(fname2, clobber=True)
