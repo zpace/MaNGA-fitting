@@ -169,11 +169,13 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     ifudsgn = ifu[1]
     fname_ifu = 'manga-{}-{}-LOGCUBE.fits.gz'.format(plate, ifudsgn)
 
-    # first read in templates
+    # read in templates
     # templates have already been convolved to the proper resolution
     tems = fits.open(fname_tem)
     htems = tems[0].header
     dtems = tems[0].data
+
+    nT, nZ, nL = dtems.shape
 
     logL_tem = np.linspace(
         htems['CRVAL3'],
@@ -185,13 +187,8 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     dtems_med = np.median(dtems)
     dtems /= dtems_med
 
-    # now read in IFU
-    ifu = fits.open(fname_ifu)
-    ifu_flux = ifu['FLUX'].data
-    ifu_ivar = ifu['ivar'].data
-    ifu_mask = ifu['MASK'].data
-    L_ifu = ifu['WAVE'].data
-    logL_ifu = np.log(L_ifu)
+    ssps = np.reshape(dtems, (nL, -1))
+    # print ssps.shape
 
     # now read in drpall
     drpall = table.Table.read(m.drpall_loc + 'drpall-v1_3_3.fits',
@@ -199,23 +196,35 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     objconds = drpall['plateifu'] == '{}-{}'.format(plate, ifudsgn)
     obj = drpall[objconds]
 
-    print obj['plateifu', 'nsa_redshift', 'nsa_vdisp', 'ebvgal']
+    # print obj['plateifu', 'nsa_redshift', 'nsa_vdisp', 'ebvgal']
 
     c = 299792.458
-    dl = L_tem[0] - L_ifu[0]
-    dv = c * (logL_tem[0] - logL_ifu[0])  # km/s
-    vel = obj['nsa_redshift'] * c
+    z = obj['nsa_redshift']
+    if z == -9999.:
+        z = 0.1
+    vel = z * c
     veldisp = obj['nsa_vdisp']
     if veldisp < 0.:  # deal with non-measured veldisps
         veldisp = 300.
 
+    # now read in IFU
+    ifu = fits.open(fname_ifu)
+    ifu_flux = ifu['FLUX'].data
+    ifu_ivar = ifu['ivar'].data
+    ifu_mask = ifu['MASK'].data
+    L_ifu = ifu['WAVE'].data
+    logL_ifu = np.log(L_ifu) - z
+    L_ifu = np.exp(logL_ifu)
+
     velscale = (logL_ifu[1] - logL_ifu[0])*c
-    moments = 4
+    dl = L_tem[0] - L_ifu[0]
+    dv = c * (logL_tem[0] - logL_ifu[0])  # km/s
+    moments = 2
     regul_err = .004
     ebvgal = obj['ebvgal']
     dv = c*(logL_tem[0] - logL_ifu[0])
-
     start = [vel, veldisp]
+    reg_dim = dtems.shape[:-1]
 
     ifu_fits = np.nan * np.ones(ifu_flux.shape[:-1])
 
@@ -224,21 +233,163 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     for spaxel in spaxels:
         if spaxel['good'] == True:
             gridx, gridy = spaxel['gridx'], spaxel['gridy']
-            goodpixels = (ifu_mask[:, gridx, gridy] & 10)
-            goodpixels *= (ifu_mask[:, gridx, gridy] & 8)
+            print 'Spaxel row {}; col {}'.format(gridx, gridy)
+            goodpixels = 1 - (ifu_mask[:, gridx, gridy] & 10)
+            goodpixels *= 1 - (ifu_mask[:, gridx, gridy] & 8)
+            goodpixels *= np.isfinite(ifu_ivar[:, gridx, gridy])
+            goodpixels_i = np.where(goodpixels)[0]
 
             galaxy = ifu_flux[:, gridx, gridy]
+            ivar = ifu_ivar[:, gridx, gridy]
+            noise = 1./np.sqrt(ivar)
+            noise = np.where(np.isfinite(noise), noise, 9999.)
             med = np.median(galaxy)
 
-            pp = ppxf(templates=dtems,
+            pp = ppxf(templates=ssps,
                       galaxy=galaxy/med,
-                      noise=1./np.sqrt(ifu_ivar[:, gridx, gridy]),
-                      goodpixels=goodpixels, vsyst=dv,
+                      noise=noise,
+                      goodpixels=goodpixels_i, start=start, vsyst=dv,
                       velScale=velscale, moments=moments, degree=-1,
                       mdegree=-1, regul=1./regul_err, reddening=ebvgal,
-                      clean=False, lam=L_ifu)
-            ifu_fits[spaxel[gridx, gridy]] = pp
-            break
+                      clean=False, lam=L_ifu, reg_dim=reg_dim)
+            return pp
+            #ifu_fits[spaxel[gridx, gridy]] = pp
+
+
+def ppxf_fig(pp, spaxel, tems, galname):
+    nT, nZ = tems[0].data.shape[:-1]
+
+    Z0 = tems[0].header['CRVAL2']
+    dZ = tems[0].header['CDELT2']
+
+    LT0 = tems[0].header['CRVAL1']
+    dLT = tems[0].header['CDELT1']
+
+    Zrange = [Z0, Z0 + (nZ - 1) * dZ]
+    logTrange = [LT0, LT0 + (nT - 1) * dLT]
+
+    print Zrange, logTrange
+
+    galaxy = pp.galaxy
+    noise = pp.noise
+
+    NAXIS1 = len(galaxy)
+
+    fig = plt.figure(figsize=(8, 6))
+
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1, 1.25, 2])
+    ax1 = plt.subplot(gs[0])
+
+    # first plot the input spectrum
+    ax1.plot(pp.lam, pp.galaxy, c='k', label='galaxy')
+    ax1.fill_between(
+        pp.lam,
+        (galaxy - noise)/np.median(galaxy),
+        (galaxy + noise)/np.median(galaxy), edgecolor='#ff5f00',
+        facecolor='coral', alpha=0.5)
+    # best fit
+    ax1.plot(pp.lam, pp.bestfit, c='r', linewidth=2, label='pPXF fit')
+    # residuals
+    mn = np.min(pp.bestfit[pp.goodpixels])
+    mx = np.max(pp.bestfit[pp.goodpixels])
+    resid = mn + pp.galaxy - pp.bestfit
+    mn1 = np.min(resid[pp.goodpixels])
+    ax1.plot(pp.lam[pp.goodpixels], resid[pp.goodpixels],
+             marker='.', markersize=2, c='cyan',
+             markeredgecolor='cyan', linestyle='None', zorder=1)
+    ax1.plot(pp.lam[pp.goodpixels], pp.goodpixels*0 + mn,
+             marker=',', c='k', zorder=0)
+
+    w = np.where(np.diff(pp.goodpixels) > 1)[0]
+    if w.size > 0:
+        for wj in w:
+            x = np.arange(pp.goodpixels[wj], pp.goodpixels[wj+1])
+            ax1.plot(pp.lam[x], resid[x], 'indigo')
+        w = np.hstack([0, w, w+1, -1])  # Add first and last point
+    else:
+        w = [0, -1]
+    for gj in pp.goodpixels[w]:
+        ax1.plot([pp.lam[gj], pp.lam[gj]], [mn, pp.bestfit[gj]],
+                 color='orange', linewidth=0.5)
+
+    # turn off tick labels for x axis
+    ax1.spines['bottom'].set_visible(False)
+    plt.setp(ax1.get_xticklabels(), visible=False)
+    ax1.set_ylabel("Counts", fontsize=16)
+    ax1.legend(loc='best')
+
+    # set up a twin axis to display pixel positions
+    # DO NOT CHANGE XLIMS OF ANYTHING!!!!
+
+    ax1_pix = ax1.twiny()
+    ax1_pix.plot(np.arange(NAXIS1), np.zeros(NAXIS1))
+    ax1_pix.set_xlim([0, NAXIS1 - 1])
+    ax1_pix.set_xlabel('Pixel')
+
+    ax1.set_ylim([mn1, mx] + np.array([-0.05, 0.05])*(mx-mn1))
+
+    # set up an axis to display residuals vs noise
+
+    ax1_res = plt.subplot(gs[1], sharex=ax1)
+    ax1_res.plot(pp.lam[pp.goodpixels],
+                 (noise/galaxy)[pp.goodpixels], marker='.',
+                 c='coral', linestyle='None', markersize=2,
+                 label='noise')
+    ax1_res.plot(pp.lam[pp.goodpixels],
+                 (resid/pp.bestfit)[pp.goodpixels], marker='.',
+                 c='cyan', linestyle='None', markersize=2,
+                 label='resid', alpha=0.5)
+    ax1_res.set_xlabel(r'$\lambda_r ~ [\AA]$')
+
+    ax1_res.legend(loc='best', prop={'size': 8})
+    ax1_res.set_ylabel(r'$\Delta_{rel}$')
+    ax1_res.set_yscale('log')
+    ax1_res.set_ylim([10**-2.5, 1.])
+
+    _ = [tick.label.set_fontsize(8) for tick in
+         ax1_res.yaxis.get_major_ticks()]
+
+    ax1.set_xlim([np.min(pp.lam), np.max(pp.lam)])
+
+    # this is just a dummy axis for spacing purposes
+    pad_ax = plt.subplot(gs[2])
+    pad_ax.axis('off')
+
+    ax2 = plt.subplot(gs[3])
+    # print s
+
+    # make a weights array for display, s.t. # rows = # Z vals
+    # and # cols = # age vals
+
+    print pp.weights.shape
+
+    # extract the kinematics of the stars first
+    weights = np.reshape(
+        pp.weights[:(nZ * nT)],
+        (nZ, nT))
+    if weights.sum() > 0.:
+        weights /= weights.sum()
+    # print weights
+
+    plt.imshow(
+        weights, origin='lower', interpolation='nearest',
+        cmap='cubehelix_r',
+        vmin=0.0, extent=(LT0 - dLT/2., logTrange[1] + dLT/2.,
+                          Z0 - dZ/2., Zrange[1] + dZ/2.))
+
+    plt.colorbar()
+    plt.title("Mass Fraction", size=16)
+    plt.xlabel(r'$\log_{10} \tau ~ [\mathrm{Gyr}]$', size=16)
+    plt.ylabel(r'$[M/H]$', size=16)
+
+    t = '{}-{} pPXF fit: spaxel ({}, {})'.format(galname[0], galname[1],
+                                                 spaxel[0], spaxel[1])
+
+    plt.suptitle(t, size=18)
+    plt.subplots_adjust(hspace=0.01, top=0.85)
+    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    return fig
 
 
 def which_spaxels(fname_ifu):
@@ -292,7 +443,7 @@ def which_spaxels(fname_ifu):
     pixels.sort(['r', 'theta'])
     pixels['order'] = range(len(pixels))
 
-    print pixels
+    # print pixels
 
     '''plt.scatter(pixels['gridx'], pixels['gridy'],
                 c=pixels['order']*pixels['good'], s=5)
