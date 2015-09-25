@@ -33,7 +33,9 @@ def convolve_variable_width(a, sig, prec=1.):
 
     sig0 = sig.max()  # the "base" width that results in minimal blurring
     # if prec = 1, just use sig0 as base.
+
     n = np.rint(prec * sig0/sig).astype(int)
+    print n.min()
     # print n
     print '\tWarped array length: {}'.format(n.sum())
     # define "warped" array a_w with n[i] instances of a[:,:,i]
@@ -59,9 +61,9 @@ def convolve_variable_width(a, sig, prec=1.):
     c = 0  # counter (don't judge me, it was early in the morning)
     for i in range(a_w_f.shape[0]):
         for j in range(a_w_f.shape[1]):
-            c += 1
+            '''c += 1
             print '\t\tComputing convolution {} of {}...'.format(
-                c, a_w_f.shape[0] * a_w_f.shape[1])
+                c, a_w_f.shape[0] * a_w_f.shape[1])'''
             a_w_f[i, j, :] = ndimage.gaussian_filter1d(
                 a_w[i, j, :], prec*sig0)
     # print a_w_f.shape # should be the same as the original shape
@@ -76,7 +78,8 @@ def convolve_variable_width(a, sig, prec=1.):
     return a_f
 
 
-def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
+def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, z=0.01,
+                                  plot=False):
     '''
     set up all the required stellar libraries for a MaNGA datacube
 
@@ -86,7 +89,7 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     print 'Reading drpall...'
     drpall = fits.open(m.drpall_loc + 'drpall-v1_3_3.fits')[0].data
 
-    print 'Reading SSPs...'
+    print 'Reading MaNGA HDU...'
     MaNGA_hdu = fits.open(fname_ifu)
 
     # open global MaNGA header
@@ -103,9 +106,9 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     tems = fits.open(fname_tem)[0]
     htems = tems.header
     logL_tem = np.linspace(
-        htems['CRVAL3'],
-        htems['CRVAL3'] + tems.data.shape[2]*htems['CDELT3'],
-        tems.data.shape[2])  # base e
+        htems['CRVAL1'],
+        htems['CRVAL1'] + (htems['NAXIS1'] - 1) * htems['CDELT1'],
+        htems['NAXIS1'])  # base e
     L_tem = np.exp(logL_tem)
 
     dL_tem = np.empty_like(L_tem)
@@ -136,9 +139,10 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
         plt.show()
 
     logL_ifu = np.log(L_ifu)
+    dlogL_ifu = np.log(10.**MaNGA_hdu[0].header['CD3_3'])
 
-    velscale_ifu = np.asarray(
-        (np.log(L_ifu[1]/L_ifu[0]) * c.c).to(u.km/u.s))
+    velscale_ifu = np.asarray((dlogL_ifu * c.c).to(u.km/u.s))
+    print 'velscale:', velscale_ifu
 
     print 'Constructing spectral library files...'
 
@@ -146,28 +150,46 @@ def setup_MaNGA_stellar_libraries(fname_ifu, fname_tem, plot=False):
     # file format is st-<REDSHIFT>.fits
     # <REDSHIFT> is of form 0.XXXX
 
-    for i, z in enumerate([0.01]):
-        print 'Template file {1} @ z = {0:.4f}'.format(z, i)
+    FWHM_diff = np.sqrt(
+        (FWHM_avg_s / (1. + z))**2. - FWHM_tem**2.)
+    sigma = FWHM_diff/2.355/dL_tem
 
-        FWHM_diff = np.sqrt(
-            (FWHM_avg_s / (1. + z))**2. - FWHM_tem**2.)
-        sigma = FWHM_diff/2.355/dL_tem
+    print tems.data.shape
 
-        a_f = convolve_variable_width(tems.data, sigma, prec=3.)
+    a_f = convolve_variable_width(tems.data, sigma, prec=4.)
+    # return a_f, dlogL_ifu, logL_tem
+    spec_ssp_new_sample, logL_ssp_new = m.ssp_rebin(
+        logL_tem, a_f[0, 0, :], dlogL_ifu)
+    spec_ssp_new = np.empty([a_f.shape[0], a_f.shape[1], len(logL_ssp_new)])
 
-        fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
-        print '\tMaking HDU:', fname2
+    for Ti in range(a_f.shape[0]):
+        for Zi in range(a_f.shape[1]):
+            spec_ssp_new[Ti, Zi, :] = m.ssp_rebin(
+                logL_tem, a_f[Ti, Zi, :], dlogL_ifu)[0]
 
-        blurred_hdu = fits.PrimaryHDU(a_f)
-        blurred_hdu.header = tems.header
-        blurred_hdu.header['z'] = z
-        blurred_hdu.writeto(fname2, clobber=True)
+    fname2 = 'stellar_libraries/st-{0:.4f}.fits'.format(z)
+    print '\tMaking HDU:', fname2
+
+    blurred_hdu = fits.PrimaryHDU(spec_ssp_new)
+    blurred_hdu.header = tems.header
+    blurred_hdu.header['z'] = z
+    blurred_hdu.header['NAXIS1'] = len(logL_ssp_new)
+    blurred_hdu.header['CRVAL1'] = logL_ssp_new[0]
+    blurred_hdu.header['CDELT1'] = dlogL_ifu
+    blurred_hdu.writeto(fname2, clobber=True)
 
 
 def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     plate = ifu[0]
     ifudsgn = ifu[1]
     fname_ifu = 'manga-{}-{}-LOGCUBE.fits.gz'.format(plate, ifudsgn)
+
+    res_path = '{}-{}/'.format(plate, ifudsgn)
+    try:
+        os.makedirs(res_path)
+    except OSError as exception:
+        if exception.errno != errno.EEXIST:
+            raise
 
     # read in templates
     # templates have already been convolved to the proper resolution
@@ -178,17 +200,15 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     nT, nZ, nL = dtems.shape
 
     logL_tem = np.linspace(
-        htems['CRVAL3'],
-        htems['CRVAL3'] + dtems.shape[2]*htems['CDELT3'],
-        dtems.shape[2])  # base e
+        htems['CRVAL1'],
+        htems['CRVAL1'] + nL*htems['CDELT1'], nL)  # base e
 
     L_tem = np.exp(logL_tem)
 
     dtems_med = np.median(dtems)
     dtems /= dtems_med
 
-    ssps = np.reshape(dtems, (nL, -1))
-    # print ssps.shape
+    ssps = np.reshape(np.swapaxes(dtems, 0, 2), (nL, -1))
 
     # now read in drpall
     drpall = table.Table.read(m.drpall_loc + 'drpall-v1_3_3.fits',
@@ -213,6 +233,7 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     ifu_ivar = ifu['ivar'].data
     ifu_mask = ifu['MASK'].data
     L_ifu = ifu['WAVE'].data
+    red_scattered_light = L_ifu > 9500.
     logL_ifu = np.log(L_ifu) - z
     L_ifu = np.exp(logL_ifu)
 
@@ -222,8 +243,7 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
     moments = 2
     regul_err = .004
     ebvgal = obj['ebvgal']
-    dv = c*(logL_tem[0] - logL_ifu[0])
-    start = [vel, veldisp]
+    start = [0., veldisp]
     reg_dim = dtems.shape[:-1]
 
     ifu_fits = np.nan * np.ones(ifu_flux.shape[:-1])
@@ -234,26 +254,28 @@ def ppxf_run_MaNGA_galaxy(ifu, fname_tem):
         if spaxel['good'] == True:
             gridx, gridy = spaxel['gridx'], spaxel['gridy']
             print 'Spaxel row {}; col {}'.format(gridx, gridy)
-            goodpixels = 1 - (ifu_mask[:, gridx, gridy] & 10)
-            goodpixels *= 1 - (ifu_mask[:, gridx, gridy] & 8)
-            goodpixels *= np.isfinite(ifu_ivar[:, gridx, gridy])
+            goodpixels = 1 - (ifu_mask[:, gridy, gridx] & 10)
+            goodpixels *= (1 - (ifu_mask[:, gridy, gridx] & 8))
+            goodpixels *= (np.isfinite(ifu_ivar[:, gridy, gridx]))
+            # red end has some scattered light, so throw it out
+            goodpixels *= (1 - red_scattered_light)
             goodpixels_i = np.where(goodpixels)[0]
 
-            galaxy = ifu_flux[:, gridx, gridy]
-            ivar = ifu_ivar[:, gridx, gridy]
+            galaxy = ifu_flux[:, gridy, gridx]
+            ivar = ifu_ivar[:, gridy, gridx]
             noise = 1./np.sqrt(ivar)
             noise = np.where(np.isfinite(noise), noise, 9999.)
             med = np.median(galaxy)
 
             pp = ppxf(templates=ssps,
                       galaxy=galaxy/med,
-                      noise=noise,
+                      noise=noise/med,
                       goodpixels=goodpixels_i, start=start, vsyst=dv,
                       velScale=velscale, moments=moments, degree=-1,
                       mdegree=-1, regul=1./regul_err, reddening=ebvgal,
                       clean=False, lam=L_ifu, reg_dim=reg_dim)
             return pp
-            #ifu_fits[spaxel[gridx, gridy]] = pp
+            # ifu_fits[spaxel[gridx, gridy]] = pp
 
 
 def ppxf_fig(pp, spaxel, tems, galname):
@@ -367,7 +389,7 @@ def ppxf_fig(pp, spaxel, tems, galname):
     # extract the kinematics of the stars first
     weights = np.reshape(
         pp.weights[:(nZ * nT)],
-        (nZ, nT))
+        (nT, nZ))
     if weights.sum() > 0.:
         weights /= weights.sum()
     # print weights
@@ -395,6 +417,9 @@ def ppxf_fig(pp, spaxel, tems, galname):
 def which_spaxels(fname_ifu):
     '''
     list of spaxel indices in the order that they should be run
+
+    WILL NEED TO BE ALTERED FOR MPL-4, SINCE THE AT THAT POINT, THE
+    NEEDED HEADER KEYWORDS WILL BE FIXED
     '''
 
     ifu = fits.open(fname_ifu)
