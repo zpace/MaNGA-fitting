@@ -881,8 +881,9 @@ class ppxf(object):
                 "Best Fit:       V     sigma        h3        h4        h5        h6")
             for j in range(self.ncomp):
                 print("comp.", j, "".join("%10.3g" % f for f in self.sol[j]))
+                print("  +/- ", "".join("%10.3g" % f for f in self.error[j]))
             print("chi2/DOF: %.4g" % self.chi2)
-            print('Function evaluations:', ncalls)
+            #print('Function evaluations:', ncalls)
             nw = self.weights.size
             if reddening is not None:
                 print('Reddening E(B-V): ', self.reddening)
